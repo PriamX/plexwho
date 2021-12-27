@@ -1,0 +1,319 @@
+#!/bin/bash
+#
+# plexwho
+#
+# This command-line script lists the current Plex streams and a few details about them.
+#
+# Example Output:
+#
+#   User         Plat Vres  Sres  TT Mbps ST Progress        Title
+#   ------------ ---- ----- ----- -- ---- -- --------------- -----
+#   neil.pye     Roku 1080p 1080p 01 3.71 pa 0:27:38/2:08:15 Basic Instinct
+#   Mike         Play 4k    1080p 11 6.41 pl 1:25:02/2:28:56 Dune
+#   ricksrevolut iOS  480p  480p  00 1.18 pl 0:46:08/1:44:16 An Audience with Sir Cliff Richard
+#   vyvbasterd   Chro 720p  720p  00 1.05 pl 0:03:31/0:27:25 The Good Life - Silly, But It's Fun...
+#
+# Meaning:
+#
+#       User: Plex username (truncated if over 12 characters)
+#       Plat: User's Plex client (truncated to 4 characters)
+#       Vres: Resolution of the video file being played
+#       Sres: Resolution of the video stream
+#         TT: Transcoded and Throttled (11 if both, 01 if throttled, 00 if none)
+#       Mbps: Stream bandwidth (in Mbps, obviously)
+#         ST: Current status playing (pl) or paused (pa)
+#   Progress: Current position in media vs total duration of media
+#      Title: The full title of the media
+#
+# Installation:
+#
+#   plexwho is intended to run on a Linux box with a bash shell.
+#   Typically drop this script into /usr/local/bin
+#   It has the following prerequisits:
+# 
+#     + tautulli: plexwho does not contact the Plex server directly, it uses tautulli
+#       to grab the information about each stream session (https://tautulli.com/)
+#     + curl: This is used to query the tautulli API (https://curl.se/)
+#     + jq: parses the data returned from tautulli (https://stedolan.github.io/jq/)
+#     + bc: for doing a bit of floating point math
+#     + tr: for cleaning up some text strings (part of coreutils)
+#
+# You can print debug output with 'plexwho -d'
+# You can view the "license" with 'plexwho -l'
+#
+# -PriamX (12/06/2021)
+#
+
+#
+# Set these variables to your own Tautulli specifics
+#
+# IP Address or URL of your Tautulli
+TAUTIP="http://tautulli"
+#
+# Tautulli Port
+TAUTPORT="8181"
+#
+# Tautulli API Key (Settings->Web Interface->API)
+TAUTAPI="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+#
+# Text colors
+# Most are unused but I include them if you'd like
+# to add more colors to plexwho or make changes
+#
+BLK='\033[0;30m'     # Black
+RED='\033[0;31m'     # Red
+GRN='\033[0;32m'     # Green
+BLU='\033[0;34m'     # Blue
+CYA='\033[0;36m'     # Cyan
+WHI='\033[0;37m'     # White
+YEL='\033[0;33m'     # Yellow
+PUR='\033[0;35m'     # Purple
+PLX='\033[38;5;220m' # Plex Yellow
+NOC='\033[0m'        # No Color
+
+#
+# Normal, Bold and Underline text
+#
+NO="\e[0m"
+BD="\e[1m"
+UL="\e[4m"
+
+#
+# Dependency checks for curl, jq, bc and tr
+#
+for PROG in "/usr/bin/curl" "/usr/bin/jq" "/usr/bin/bc" "/usr/bin/tr"
+do
+	if ! [ -e "$PROG" ]
+	then
+        	echo "Warning: $PROG not found, please install it."
+        	exit 1
+	fi
+done
+
+#
+# plexwho is free 
+#
+view_license () {
+cat << EOF
+plexwho is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+EOF
+}
+
+#
+# Handle optional debug flag (-d) or exit on bad flag
+#
+[ $@ ] && getopts :hdl FLAG
+case "${FLAG}" in
+	h)
+		echo "Usage: $0 [-h] [-d] [-l]"
+		echo "  -h: this help"
+		echo "  -d: print debug output"
+		echo "  -l: view the unlicense"
+		exit 0
+		;;
+	d)
+		DEBUG=1
+		echo "Printing DEBUG output..."
+		;;
+	l)
+		view_license
+		exit 0
+		;;
+	\?)
+		echo "ERROR: Invalid option -$OPTARG"
+		exit 1
+		;;
+	*)
+		;;
+esac
+
+#
+# Contact Tautulli through the API and get the stream activity
+#
+PLEXSTATS="$(curl -s "$TAUTIP:$TAUTPORT/tautulli/api/v2?apikey=$TAUTAPI&cmd=get_activity")"
+
+#
+# For debugging, print what was returned from tautulli
+#
+[ $DEBUG ] && echo "###DEBUG### PLEXSTATS: $PLEXSTATS"
+
+#
+# Check to see if we got a good reply from tautulli that includes the stream count
+# If not, then we likely don't have a connection; exit with a nonzero status.
+#
+if [[ $PLEXSTATS =~ stream_count ]]
+then
+	COUNT=`echo "$PLEXSTATS" | jq '.response.data.stream_count' | tr -d '"'`
+else
+	echo -e "${RED}No server connection (either Tautulli or Plex).${NOC}"
+	exit 1
+fi
+
+#
+# For debugging, the number of current plex streams
+#
+[ $DEBUG ] && echo "###DEBUG### STREAM COUNT: $COUNT"
+
+#
+# If there are no current streams, say so and exit
+#
+if [ $COUNT -lt 1 ]
+then
+	echo -e "${PLX}No active streams.${NOC}"
+	exit 0
+fi
+
+#
+# For debugging, print parsed sessions array (user and media title)
+#
+if [ $DEBUG ]
+then
+	LIST=`echo "$PLEXSTATS" | jq '.response.data.sessions[] | "\(.user): \(.full_title)"'`
+	echo "###DEBUG### SESSIONS: $LIST\n"
+fi
+
+#
+# Parse out each of the data attributes collected above into its own list of strings
+#
+USERS=`echo "$PLEXSTATS" | jq '.response.data.sessions[].user'`
+PLATF=`echo "$PLEXSTATS" | jq '.response.data.sessions[].platform'`
+VRESO=`echo "$PLEXSTATS" | jq '.response.data.sessions[].video_full_resolution'`
+SRESO=`echo "$PLEXSTATS" | jq '.response.data.sessions[].stream_video_full_resolution'`
+TRANS=`echo "$PLEXSTATS" | jq '.response.data.sessions[].transcode_hw_full_pipeline'`
+BANDW=`echo "$PLEXSTATS" | jq '.response.data.sessions[].bandwidth'` # given in kbps
+THROT=`echo "$PLEXSTATS" | jq '.response.data.sessions[].throttled'`
+STATE=`echo "$PLEXSTATS" | jq '.response.data.sessions[].state'`
+PROGR=`echo "$PLEXSTATS" | jq '.response.data.sessions[].view_offset'` # using this instead of progress_percent
+DURAT=`echo "$PLEXSTATS" | jq '.response.data.sessions[].duration'` # given in 100th of a second
+SHOWS=`echo "$PLEXSTATS" | jq '.response.data.sessions[].full_title'`
+
+# Note: For non-video files, the following attributes are missing:
+#   stream_video_full_resolution (as null)
+#   bandwidth (as empty)
+
+#
+# Set the Input Field Separator (IFS) to newline and write our list of strings
+# into variable arrays.
+#
+IFS=$'\n' read -rd '' -a user_array <<< "$USERS"
+IFS=$'\n' read -rd '' -a plat_array <<< "$PLATF"
+IFS=$'\n' read -rd '' -a vres_array <<< "$VRESO"
+IFS=$'\n' read -rd '' -a sres_array <<< "$SRESO"
+IFS=$'\n' read -rd '' -a tran_array <<< "$TRANS"
+IFS=$'\n' read -rd '' -a band_array <<< "$BANDW"
+IFS=$'\n' read -rd '' -a thro_array <<< "$THROT"
+IFS=$'\n' read -rd '' -a stat_array <<< "$STATE"
+IFS=$'\n' read -rd '' -a prog_array <<< "$PROGR"
+IFS=$'\n' read -rd '' -a dura_array <<< "$DURAT"
+IFS=$'\n' read -rd '' -a show_array <<< "$SHOWS"
+
+#
+# Print the plexwho header
+#
+printf "${PLX}${UL}%-12.12s${NO} ${PLX}${UL}%-4.4s${NO} ${PLX}${UL}%-5.5s${NO} ${PLX}${UL}%-5.5s${NO} ${PLX}${UL}%-2.2s${NO} ${PLX}${UL}%-4.4s${NO} ${PLX}${UL}%-2.2s${NO} ${PLX}${UL}%-15.15s${NO} ${PLX}${UL}%s${NO}${NOC}\n" "User" "Plat" "Vres" "Sres" "TT" "Mbps" "ST" "Progress" "Title"
+
+#
+# Loop on the user_array (using it like a index key)
+#
+for INDEX in "${!user_array[@]}"
+do
+	#
+	# On each iteration, assign temporary variables for this stream session
+	#
+	USER=`echo "${user_array[INDEX]%@*}" | tr -d '"'`
+	PLAT=`echo "${plat_array[INDEX]%@*}" | tr -d '"'`
+	VRES=`echo "${vres_array[INDEX]%@*}" | tr -d '"'`
+	SRES=`echo "${sres_array[INDEX]%@*}" | tr -d '"'`
+	TRAN=`echo "${tran_array[INDEX]%@*}" | tr -d '"'`
+	BAND=`echo "${band_array[INDEX]%@*}" | tr -d '"'`
+	THRO=`echo "${thro_array[INDEX]%@*}" | tr -d '"'`
+	STAT=`echo "${stat_array[INDEX]%@*}" | tr -d '"'`
+	PROG=`echo "${prog_array[INDEX]%@*}" | tr -d '"'`
+	DURA=`echo "${dura_array[INDEX]%@*}" | tr -d '"'`
+	SHOW=`echo "${show_array[INDEX]%@*}" | tr -d '"'`
+
+	#
+	# If the bandwidth variable is empty or null, assign it to 0
+	#
+	if [ -z $BAND ]
+	then
+		BAND=0
+	fi
+
+	#
+	# A little math to change the bandwidth from kbps to Mbps
+	#
+	BW=`echo "scale=2; ${BAND} / 1000" | bc`
+
+	#
+	# Hmm. If our bandwidth comes up as a rediculously large number
+	# then just set it really high so I know it can't be real
+	# (I'm not sure why tautulli does this yet, or how to handle it)
+	#
+	# Otherwise see if Mbps is >= 10.0 and change the decimal precision
+	# to 1 (for formatting), or use 2 decimal places (most cases so far)
+	#
+	if (( $(echo "$BW > 99.9" | bc -l) ))
+	then
+		DEC=0
+		BW=9999
+	elif (( $(echo "$BW >= 10.0" | bc -l) ))
+	then
+        	DEC=1
+	else
+		DEC=2
+	fi
+
+	#
+	# Calculate and format time (played and remaining)
+	#
+	((DUR=$DURA / 1000))
+	((PRO=$PROG / 1000))
+	((THOU=$DUR / 3600))
+	((TMIN=($DUR % 3600) / 60))
+	((TSEC=$DUR % 60))
+	((PHOU=$PRO / 3600))
+	((PMIN=($PRO % 3600) / 60))
+	((PSEC=$PRO % 60))
+
+	#
+	# User our temporal variables from above and create a "time" output string
+	#
+	TIME=$(printf "%2d:%02d:%02d/%2d:%02d:%02d\n" "$PHOU" "$PMIN" "$PSEC" "$THOU" "$TMIN" "$TSEC")
+	TC=`echo $TIME | tr -d ' '` # Delete any spaces
+
+	#
+	# Print out our stream information with fancy formatting
+	#
+	printf "${BD}%-12.12s${NO} %-4.4s %-5.5s %-5.5s %1d%1d %4.*f %-2.2s %-15.15s ${PUR}%s${NOC}\n" "$USER" "$PLAT" "$VRES" "$SRES" "$TRAN" "$THRO" "$DEC" "$BW" "$STAT" "$TC" "$SHOW"
+done
+
+#
+# Exit nicely from plexwho
+#
+exit 0
+
